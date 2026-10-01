@@ -1,0 +1,12 @@
+node_modules
+dist
+*.log
+.DS_Store
+.env
+
+# 运行时生成的对话记录
+conversation.txt
+conversation.ai.txt
+
+# 讲解文档 / 草稿
+notes/

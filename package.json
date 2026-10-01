@@ -1,0 +1,28 @@
+{
+  "name": "how-to-build-an-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "donut": "node src/donut.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "pnpm@10.5.2",
+  "dependencies": {
+    "@ai-sdk/deepseek": "^3.0.44",
+    "@earendil-works/pi-agent-core": "^0.99.2",
+    "@earendil-works/pi-ai": "^0.99.2",
+    "ai": "^7.0.99",
+    "zod": "^4.6.5"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  // 说明：本配置面向「Node 原生执行 .ts 文件 + tsc 只做类型检查」的用法。
+  // 运行：node src/index.ts     检查：pnpm typecheck
+  "compilerOptions": {
+    /* ---- 语言 / 运行时目标 ---- */
+    "target": "ES2024", // 生成/检查的语法级别，Node 26 全支持
+    "lib": ["ES2024"],
+    "types": ["node"], // 只加载 @types/node，避免被别的包污染全局类型
+
+    /* ---- 模块系统（ESM）---- */
+    "module": "nodenext", // 跟随 package.json 的 "type": "module"
+    "moduleResolution": "nodenext",
+    "moduleDetection": "force", // 每个文件都当模块，不用写 export {} 防污染
+    "verbatimModuleSyntax": true, // 类型导入必须写成 `import type`，否则运行时找不到模块
+    "resolveJsonModule": true,
+
+    /* ---- 让 Node 直接跑 .ts 的关键两项 ---- */
+    "allowImportingTsExtensions": true, // 允许 import "./foo.ts"（Node 不会自动补后缀）
+    "rewriteRelativeImportExtensions": true, // 万一真要用 tsc 产出 JS，把 .ts 后缀改成 .js
+    "erasableSyntaxOnly": true, // 禁止 enum / namespace / 构造函数参数属性等无法被"擦除"的语法
+
+    /* ---- 输出 ---- */
+    // 平时不产出文件；需要发布 / 部署时用 `pnpm build`（它会读下面的 outDir）
+    "noEmit": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+
+    /* ---- 严格性 ---- */
+    "strict": true,
+    "noUncheckedIndexedAccess": true, // arr[0] 的类型是 T | undefined
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    /* ---- 杂项 ---- */
+    "skipLibCheck": true, // 不检查 node_modules 里的 .d.ts，快很多
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true // 保证每个文件都能被单独转译
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
