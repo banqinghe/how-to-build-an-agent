@@ -3,9 +3,18 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createModels, Type, validateToolArguments } from '@earendil-works/pi-ai';
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
-import type { Message, ToolCall, UserMessage, Static, Tool, AssistantMessage, TSchema, ToolResultMessage } from '@earendil-works/pi-ai';
-
-type GetUserMessageFunction = () => Promise<string | null>;
+import type {
+    Api,
+    Context,
+    Model,
+    MutableModels,
+    Static,
+    TSchema,
+    Tool,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+} from '@earendil-works/pi-ai';
 
 type ExecutableTool<S extends TSchema = TSchema> = Tool<S> & {
     execute(args: Static<S>): Promise<string>;
@@ -59,68 +68,59 @@ const bashTool = defineTool({
     },
 });
 
-const tools: ExecutableTool[] = [
+const defaultTools: ExecutableTool[] = [
     bashTool,
 ];
 
+const SYSTEM_PROMPT = 'You are a helpful assistant';
+
 class Agent {
-    getUserMessage: GetUserMessageFunction;
-    chat: (messages: Message[]) => Promise<AssistantMessage>;
+    models: MutableModels;
+    model: Model<Api>;
+    context: Context;
 
-    constructor(getUserMessage: GetUserMessageFunction) {
-        const models = createModels();
-        models.setProvider(deepseekProvider());
-        const model = models.getModel('deepseek', 'deepseek-flash');
+    constructor(tools: ExecutableTool[] = defaultTools, systemPrompt: string = SYSTEM_PROMPT) {
+        this.models = createModels();
+        this.models.setProvider(deepseekProvider());
 
+        const model = this.models.getModel('deepseek', 'deepseek-flash');
         if (!model) {
-            throw new Error('Unknow model: deepseek/deepseek-flash');
+            throw new Error('Unknown model: deepseek/deepseek-flash');
         }
+        this.model = model;
 
-        this.chat = messages => models.completeSimple(
-            model,
-            {
-                systemPrompt: 'Your are a helpful assistant',
-                messages,
-                tools,
-            },
-        );
-
-        this.getUserMessage = getUserMessage;
+        // Single source of truth: the same list is sent to the model and used to look up tools to execute.
+        this.context = {
+            systemPrompt,
+            messages: [],
+            tools,
+        };
     }
 
-    async run() {
-        const messages: Message[] = [];
+    /** Start a new session: clear the conversation history, keep systemPrompt and tools. */
+    reset() {
+        this.context = { ...this.context, messages: [] };
+    }
 
-        console.log('Chat with Deepseek (use \'ctrl-d\' to quit)\n');
+    /** Push a user message, then keep running until the model stops calling tools. */
+    async prompt(input: string) {
+        const userMessage: UserMessage = {
+            role: 'user',
+            content: input,
+            timestamp: Date.now(),
+        };
+        this.context.messages.push(userMessage);
+        await this.runAgentLoop();
+    }
 
-        let hasToolExecution = false;
-
+    async runAgentLoop() {
         while (true) {
-            if (!hasToolExecution) {
-                const userInput = await this.getUserMessage();
-                if (!userInput) {
-                    break;
-                }
-                const userMessage: UserMessage = {
-                    role: 'user',
-                    content: userInput,
-                    timestamp: Date.now(),
-                };
-                messages.push(userMessage);
-            }
-
-            // call llm endpoint
-            // append:
-            //    a. user input
-            // or b. tool result
-            const result = await this.chat(messages);
-            messages.push(result);
+            const result = await this.models.completeSimple(this.model, this.context);
+            this.context.messages.push(result);
 
             if (result.stopReason === 'error') {
-                // 红色输出？
                 console.error(`\x1b[91merror ${result.errorMessage}\x1b[0m`);
-                hasToolExecution = false;
-                continue;
+                return;
             }
 
             const calls: ToolCall[] = [];
@@ -139,34 +139,43 @@ class Agent {
             }
 
             for (const call of calls) {
-                const tool = tools.find(t => t.name === call.name);
-                let toolResult = '';
-                let isError = false;
-                if (!tool) {
-                    toolResult = `${call.name} is a non-existent tool`;
-                    isError = true;
-                } else {
-                    try {
-                        console.log(`\u001b[92mtool\u001b[0m: ${call.name}(${JSON.stringify(call.arguments)})\n`);
-                        toolResult = await tool.execute(validateToolArguments(tool, call));
-                    } catch (err) {
-                        toolResult = `Error executing tool ${tool.name}: ${err}`;
-                        isError = true;
-                    }
-                }
-                const toolResultMessage: ToolResultMessage = {
-                    role: 'toolResult',
-                    toolCallId: call.id,
-                    toolName: call.name,
-                    content: [{ type: 'text', text: toolResult }],
-                    isError,
-                    timestamp: Date.now(),
-                };
-                messages.push(toolResultMessage);
+                this.context.messages.push(await this.executeTool(call));
             }
 
-            hasToolExecution = calls.length > 0;
+            // No more tool calls -> this turn is done; go back to main and wait for the next input.
+            if (calls.length === 0) {
+                return;
+            }
         }
+    }
+
+    async executeTool(call: ToolCall): Promise<ToolResultMessage> {
+        const tool = this.context.tools?.find(t => t.name === call.name) as ExecutableTool | undefined;
+
+        let toolResult = '';
+        let isError = false;
+
+        if (!tool) {
+            toolResult = `${call.name} is a non-existent tool`;
+            isError = true;
+        } else {
+            try {
+                console.log(`\u001b[92mtool\u001b[0m: ${call.name}(${JSON.stringify(call.arguments)})\n`);
+                toolResult = await tool.execute(validateToolArguments(tool, call));
+            } catch (err) {
+                toolResult = `Error executing tool ${tool.name}: ${err}`;
+                isError = true;
+            }
+        }
+
+        return {
+            role: 'toolResult',
+            toolCallId: call.id,
+            toolName: call.name,
+            content: [{ type: 'text', text: toolResult }],
+            isError,
+            timestamp: Date.now(),
+        };
     }
 }
 
@@ -182,17 +191,26 @@ function createTerminalSource(rl: readline.Interface) {
     };
 }
 
-function main() {
+async function main() {
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
     });
     const getUserMessage = createTerminalSource(rl);
 
-    const agent = new Agent(getUserMessage);
-    agent
-        .run()
-        .finally(() => rl.close());
+    const agent = new Agent();
+
+    console.log('Chat with Deepseek (use \'ctrl-d\' to quit)\n');
+
+    while (true) {
+        const userInput = await getUserMessage();
+        if (!userInput) {
+            break;
+        }
+        await agent.prompt(userInput);
+    }
+
+    rl.close();
 }
 
 main();
