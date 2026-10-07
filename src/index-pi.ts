@@ -1,90 +1,174 @@
 import * as readline from 'node:readline/promises';
-import * as fs from 'node:fs/promises';
-import { createModels, Type } from '@earendil-works/pi-ai';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createModels, Type, validateToolArguments } from '@earendil-works/pi-ai';
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
-import { Agent, type AgentTool } from '@earendil-works/pi-agent-core';
+import type { Message, ToolCall, UserMessage, Static, Tool, AssistantMessage, TSchema, ToolResultMessage } from '@earendil-works/pi-ai';
 
-// ====== Provider ======
-// Models 是一个 provider 集合：provider 自己带着模型清单、认证方式和线协议。
-// DeepSeek 的认证走 DEEPSEEK_API_KEY，这里不需要手动传 key。
-const models = createModels();
-models.setProvider(deepseekProvider());
-const model = models.getModel('deepseek', 'deepseek-flash');
-if (!model) {
-    throw new Error('Unknown model: deepseek/deepseek-flash');
+type GetUserMessageFunction = () => Promise<string | null>;
+
+type ExecutableTool<S extends TSchema = TSchema> = Tool<S> & {
+    execute(args: Static<S>): Promise<string>;
 }
 
-// ====== Read File Tool ======
-const readFileInputSchema = Type.Object({
-    path: Type.String({ description: 'The relative path of a file in the working directory.' }),
-});
-const readFileTool: AgentTool<typeof readFileInputSchema> = {
-    name: 'read_file',
-    label: 'Read file',
-    description: 'Read the contents of a given relative file path. Use this when you want to see what\'s inside a file. Do not use this with directory names.',
-    parameters: readFileInputSchema,
-    execute: async (_toolCallId, { path }) => ({
-        content: [{ type: 'text', text: await fs.readFile(path, 'utf-8') }],
-        details: { path },
+function defineTool<S extends TSchema>(tool: ExecutableTool<S>): ExecutableTool<S> {
+    return tool;
+}
+
+type BashError = {
+    stdout?: string;
+    stderr?: string;
+    code?: number;
+    killed?: boolean;
+};
+
+const execAsync = promisify(exec);
+const MAX_OUTPUT = 30_000;
+
+function tail(text: string) {
+    return text.length > MAX_OUTPUT
+        ? `[truncated, showing last ${MAX_OUTPUT} chars]\n${text.slice(-MAX_OUTPUT)}`
+        : text;
+}
+
+const bashTool = defineTool({
+    name: 'bash',
+    description: 'Execute a bash command in the current working directory and return its stdout and stderr. Do not run interactive commands or commands that never exit (dev servers, watchers).',
+    parameters: Type.Object({
+        command: Type.String({ description: 'The bash command to execute.' }),
+        timeout: Type.Optional(
+            Type.Number({ description: 'Timeout in seconds. Defaults to 30.' })
+        ),
     }),
-};
-
-// ====== List File Tool ======
-const listFileInputSchema = Type.Object({
-    path: Type.String({ description: 'The relative path of a directory in the working directory.' }),
-});
-const listFileTool: AgentTool<typeof listFileInputSchema> = {
-    name: 'list_file',
-    label: 'List directory',
-    description: 'List the contents of a given relative directory path. Use this when you want to see what files are inside a directory. Do not use this with file paths.',
-    parameters: listFileInputSchema,
-    execute: async (_toolCallId, { path }) => {
-        const content = await fs.readdir(path, { withFileTypes: true });
-        return {
-            content: [{ type: 'text', text: JSON.stringify(content, null, 2) }],
-            details: { path },
-        };
-    },
-};
-
-// ====== Edit File Tool ======
-const editFileInputSchema = Type.Object({
-    path: Type.String({ description: 'The relative path of a file in the working directory.' }),
-    oldString: Type.String({ description: 'Text to search for - must match exactly and must only have one match exactly' }),
-    newString: Type.String({ description: 'Text to replace the oldString with.' }),
-});
-const editFileTool: AgentTool<typeof editFileInputSchema> = {
-    name: 'edit_file',
-    label: 'Edit file',
-    description: `Make edits to a text file.
-
-Replaces 'oldString' with 'newString' in the given file. 'oldString' and 'newString' MUST be different from each other.
-
-If the file specified with path doesn't exist, it will be created.`,
-    parameters: editFileInputSchema,
-    execute: async (_toolCallId, { path, oldString, newString }) => {
-        let content = '';
+    execute: async ({ command, timeout = 30 }) => {
         try {
-            content = await fs.readFile(path, 'utf-8');
+            const { stdout, stderr } = await execAsync(
+                command,
+                {
+                    shell: '/bin/bash',
+                    timeout: timeout * 1000,
+                    maxBuffer: 10 * 1024 * 1024,
+                },
+            );
+            return tail(stdout + stderr) || '(no output)';
         } catch (err) {
-            // If the file doesn't exist, it will be created when writing.
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                content = '';
-            } else {
-                throw new Error(`Failed to read the file at path "${path}": ${(err as Error).message}`);
-            }
+            const { stdout = '', stderr = '', code, killed } = err as BashError;
+            const status = killed ? `Command timed out after ${timeout} seconds` : `Exit code ${code}`;
+            throw new Error(`${tail(stdout + stderr)}\n\n${status}`);
         }
-        if (!content.includes(oldString)) {
-            throw new Error(`The string "${oldString}" was not found in the file.`);
-        }
-        const nextContent = content.replace(oldString, newString);
-        await fs.writeFile(path, nextContent, 'utf-8');
-        return {
-            content: [{ type: 'text', text: nextContent }],
-            details: { path },
-        };
     },
-};
+});
+
+const tools: ExecutableTool[] = [
+    bashTool,
+];
+
+class Agent {
+    getUserMessage: GetUserMessageFunction;
+    chat: (messages: Message[]) => Promise<AssistantMessage>;
+
+    constructor(getUserMessage: GetUserMessageFunction) {
+        const models = createModels();
+        models.setProvider(deepseekProvider());
+        const model = models.getModel('deepseek', 'deepseek-flash');
+
+        if (!model) {
+            throw new Error('Unknow model: deepseek/deepseek-flash');
+        }
+
+        this.chat = messages => models.completeSimple(
+            model,
+            {
+                systemPrompt: 'Your are a helpful assistant',
+                messages,
+                tools,
+            },
+        );
+
+        this.getUserMessage = getUserMessage;
+    }
+
+    async run() {
+        const messages: Message[] = [];
+
+        console.log('Chat with Deepseek (use \'ctrl-d\' to quit)\n');
+
+        let hasToolExecution = false;
+
+        while (true) {
+            if (!hasToolExecution) {
+                const userInput = await this.getUserMessage();
+                if (!userInput) {
+                    break;
+                }
+                const userMessage: UserMessage = {
+                    role: 'user',
+                    content: userInput,
+                    timestamp: Date.now(),
+                };
+                messages.push(userMessage);
+            }
+
+            // call llm endpoint
+            // append:
+            //    a. user input
+            // or b. tool result
+            const result = await this.chat(messages);
+            messages.push(result);
+
+            if (result.stopReason === 'error') {
+                // 红色输出？
+                console.error(`\x1b[91merror ${result.errorMessage}\x1b[0m`);
+                hasToolExecution = false;
+                continue;
+            }
+
+            const calls: ToolCall[] = [];
+
+            for (const content of result.content) {
+                switch (content.type) {
+                    case 'thinking':
+                        console.log(`\x1b[90m${content.thinking}\x1b[0m\n`);
+                        break;
+                    case 'text':
+                        console.log(`\x1b[93mDeepseek\x1b[0m: ${content.text}\n`);
+                        break;
+                    case 'toolCall':
+                        calls.push(content);
+                }
+            }
+
+            for (const call of calls) {
+                const tool = tools.find(t => t.name === call.name);
+                let toolResult = '';
+                let isError = false;
+                if (!tool) {
+                    toolResult = `${call.name} is a non-existent tool`;
+                    isError = true;
+                } else {
+                    try {
+                        console.log(`\u001b[92mtool\u001b[0m: ${call.name}(${JSON.stringify(call.arguments)})\n`);
+                        toolResult = await tool.execute(validateToolArguments(tool, call));
+                    } catch (err) {
+                        toolResult = `Error executing tool ${tool.name}: ${err}`;
+                        isError = true;
+                    }
+                }
+                const toolResultMessage: ToolResultMessage = {
+                    role: 'toolResult',
+                    toolCallId: call.id,
+                    toolName: call.name,
+                    content: [{ type: 'text', text: toolResult }],
+                    isError,
+                    timestamp: Date.now(),
+                };
+                messages.push(toolResultMessage);
+            }
+
+            hasToolExecution = calls.length > 0;
+        }
+    }
+}
 
 function createTerminalSource(rl: readline.Interface) {
     return async function(): Promise<string | null> {
@@ -98,104 +182,16 @@ function createTerminalSource(rl: readline.Interface) {
     };
 }
 
-// ====== Agent ======
-// agent 自己持有整个 transcript（agent.state.messages），
-// 并且 prompt() 会一直跑到模型给出最终答复，tool loop 在它内部。
-const agent = new Agent({
-    initialState: {
-        model,
-        tools: [readFileTool, listFileTool, editFileTool],
-        thinkingLevel: 'low',
-    },
-    streamFn: models.streamSimple.bind(models),
-});
-
-const RESET = '\x1b[0m';
-let reasoningOpen = false;
-
-// 两条注意事项：
-// 1. thinking_start 会先于内容发出，有时候那个思考块里一个字都没有
-//    （实测 turn 1 就是 thinking_start 之后直接 text_start），
-//    所以灰色转义码要等到第一个 thinking_delta 才写，否则会多出空行。
-// 2. thinking_end 的时机不可靠，它可能晚于 text_start 才发，
-//    所以只要开始写别的东西，就把灰色这一段收掉。
-function closeReasoning() {
-    if (!reasoningOpen) {
-        return;
-    }
-    process.stdout.write(`${RESET}\n\n`);
-    reasoningOpen = false;
-}
-
-agent.subscribe((event) => {
-    if (event.type === 'message_update') {
-        const part = event.assistantMessageEvent;
-        switch (part.type) {
-            case 'thinking_delta':
-                if (!reasoningOpen) {
-                    process.stdout.write('\x1b[90m');
-                    reasoningOpen = true;
-                }
-                process.stdout.write(part.delta);
-                break;
-            case 'thinking_end':
-                closeReasoning();
-                break;
-            case 'text_start':
-                closeReasoning();
-                process.stdout.write(`\x1b[93mDeepseek${RESET}: `);
-                break;
-            case 'text_delta':
-                process.stdout.write(part.delta);
-                break;
-            case 'text_end':
-                process.stdout.write('\n\n');
-                break;
-            default:
-                break;
-        }
-    }
-
-    // tool calls：在工具真正执行前打印，和 index-aisdk-agent 的 onToolExecutionStart 对齐
-    if (event.type === 'tool_execution_start') {
-        closeReasoning();
-        console.log(`\u001b[92mtool${RESET}: ${event.toolName}(${JSON.stringify(event.args)})\n`);
-    }
-
-    // 兜底：万一某个 provider 没发 thinking_end / text_start，别让灰色一直挂着
-    if (event.type === 'message_end') {
-        closeReasoning();
-    }
-
-    // pi 不像 Vercel 那样抛异常，失败会编码成一条 assistant 消息，这里得自己看
-    if (event.type === 'message_end' && event.message.role === 'assistant') {
-        if (event.message.stopReason === 'error') {
-            console.error(`\x1b[91merror\x1b[0m: ${event.message.errorMessage}`);
-        }
-    }
-});
-
-async function chat(getUserMessage: () => Promise<string | null>) {
-    console.log('Chat with Deepseek (use \'ctrl-d\' to quit)\n');
-
-    while (true) {
-        const userInput = await getUserMessage();
-        if (!userInput) {
-            break;
-        }
-
-        // 不用再维护 conversation，也不用再手写 tool loop
-        await agent.prompt(userInput);
-    }
-}
-
 function main() {
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
     });
     const getUserMessage = createTerminalSource(rl);
-    chat(getUserMessage)
+
+    const agent = new Agent(getUserMessage);
+    agent
+        .run()
         .finally(() => rl.close());
 }
 
