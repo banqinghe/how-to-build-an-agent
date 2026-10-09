@@ -5,6 +5,7 @@ import { createModels, Type, validateToolArguments } from '@earendil-works/pi-ai
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek';
 import type {
     Api,
+    AssistantMessage,
     Context,
     Model,
     MutableModels,
@@ -115,27 +116,40 @@ class Agent {
 
     async runAgentLoop() {
         while (true) {
-            const result = await this.models.completeSimple(this.model, this.context);
-            this.context.messages.push(result);
+            const stream = this.models.streamSimple(this.model, this.context);
 
-            if (result.stopReason === 'error') {
-                console.error(`\x1b[91merror ${result.errorMessage}\x1b[0m`);
-                return;
-            }
-
+            let result: AssistantMessage | undefined;
             const calls: ToolCall[] = [];
 
-            for (const content of result.content) {
-                switch (content.type) {
-                    case 'thinking':
-                        console.log(`\x1b[90m${content.thinking}\x1b[0m\n`);
+            for await (const event of stream) {
+                switch (event.type) {
+                    case 'text_end':
+                        console.log(`\x1b[93mDeepseek\x1b[0m: ${event.content}\n`);
                         break;
-                    case 'text':
-                        console.log(`\x1b[93mDeepseek\x1b[0m: ${content.text}\n`);
+                    case 'thinking_end':
+                        console.log(`\x1b[90m${event.content}\x1b[0m\n`);
                         break;
-                    case 'toolCall':
-                        calls.push(content);
+                    case 'toolcall_end':
+                        calls.push(event.toolCall);
+                        break;
+                    case 'done':
+                        result = event.message;
+                        break;
+                    case 'error':
+                        result = event.error;
+                        console.error(`\x1b[91merror ${event.error.errorMessage}\x1b[0m`);
+                        break;
                 }
+            }
+
+            if (!result) {
+                throw new Error('Stream ended without a done or error event');
+            }
+            this.context.messages.push(result);
+
+            // do not execute tool calls when error or aborted
+            if (result.stopReason === 'error' || result.stopReason === 'aborted') {
+                return;
             }
 
             for (const call of calls) {
