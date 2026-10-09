@@ -116,7 +116,7 @@ class Agent {
 
     async runAgentLoop() {
         while (true) {
-            const stream = this.models.streamSimple(this.model, this.context);
+            const stream = this.models.streamSimple(this.model, this.context, { reasoning: 'low' });
 
             let result: AssistantMessage | undefined;
             const calls: ToolCall[] = [];
